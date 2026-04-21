@@ -23,6 +23,8 @@ vendor/
 # Go workspace file
 go.work
 go.work.sum
+/bin/
+/dist/
 
 # env file
 .env
@@ -30,3 +32,11 @@ go.work.sum
 # Editor/IDE
 .idea/
 .vscode/
+*.swp
+.DS_Store
+
+# Servagent local
+/state.db
+/state.db-wal
+/state.db-shm
+*.token
