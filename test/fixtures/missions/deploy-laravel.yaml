@@ -1,0 +1,260 @@
+# Exemple de mission Servagent — Déploiement Laravel
+#
+# Ce fichier illustre une mission complète qui correspond au "wow moment"
+# du brief : déployer une app Laravel depuis GitHub sur un domaine public,
+# avec BDD, TLS, queues et backups.
+#
+# À faire valider contre schemas/mission.schema.json avant exécution.
+
+schema_version: 1
+mission_id: deploy-monapp-2026-04-20-abc123
+created_by: claude-desktop
+created_at: 2026-04-20T14:30:00Z
+goal: "Déployer github.com/odura/monapp (Laravel) sur https://monapp.fr"
+mode: execute
+
+context:
+  vps: prod-web-01
+  domain: monapp.fr
+  repo: https://github.com/odura/monapp
+  environment: production
+
+steps:
+
+  # --- Phase 1 : préparation ---
+
+  - id: apt-update
+    tool: apt_update
+    description: "Rafraîchir l'index des paquets"
+
+  - id: clone-repo
+    tool: git_clone
+    description: "Cloner le dépôt applicatif"
+    params:
+      repo: https://github.com/odura/monapp
+      dest: /var/www/monapp
+      branch: main
+    depends_on: [apt-update]
+
+  - id: detect-stack
+    tool: detect_stack
+    description: "Détecter le type d'application et ses besoins"
+    params:
+      path: /var/www/monapp
+    output_var: stack
+    depends_on: [clone-repo]
+
+  # --- Phase 2 : système ---
+
+  - id: install-php
+    tool: install_package
+    description: "Installer PHP et les extensions requises par Laravel"
+    params:
+      packages:
+        - php8.3-fpm
+        - php8.3-cli
+        - php8.3-mysql
+        - php8.3-mbstring
+        - php8.3-xml
+        - php8.3-curl
+        - php8.3-zip
+        - php8.3-bcmath
+    depends_on: [detect-stack]
+
+  - id: install-composer
+    tool: install_package
+    description: "Installer Composer"
+    params:
+      packages: [composer]
+    depends_on: [install-php]
+
+  # --- Phase 3 : base de données ---
+
+  - id: create-db
+    tool: create_database
+    description: "Créer la base MySQL de l'application"
+    params:
+      name: monapp_prod
+      charset: utf8mb4
+      collation: utf8mb4_unicode_ci
+    output_var: db
+    depends_on: [detect-stack]
+
+  - id: create-db-user
+    tool: create_db_user
+    description: "Créer l'utilisateur MySQL dédié à l'app"
+    params:
+      username: monapp
+      database: ${db.name}
+      host: localhost
+      password_strategy: generate_and_return
+    output_var: db_user
+    depends_on: [create-db]
+
+  # --- Phase 4 : configuration applicative ---
+
+  - id: composer-install
+    tool: run_script
+    description: "Installer les dépendances PHP"
+    params:
+      cwd: /var/www/monapp
+      command: "composer install --no-dev --optimize-autoloader"
+      run_as: www-data
+    depends_on: [install-composer]
+    timeout_seconds: 600
+
+  - id: write-env
+    tool: write_file
+    description: "Générer le fichier .env avec les credentials BDD"
+    params:
+      path: /var/www/monapp/.env
+      content_template: laravel_env
+      variables:
+        APP_ENV: production
+        APP_DEBUG: false
+        APP_URL: https://monapp.fr
+        DB_HOST: localhost
+        DB_DATABASE: ${db.name}
+        DB_USERNAME: ${db_user.username}
+        DB_PASSWORD: ${db_user.password}
+      mode: "0640"
+      owner: www-data
+      group: www-data
+    depends_on: [create-db-user, composer-install]
+
+  - id: artisan-migrate
+    tool: run_script
+    description: "Exécuter les migrations Laravel"
+    params:
+      cwd: /var/www/monapp
+      command: "php artisan migrate --force"
+      run_as: www-data
+    depends_on: [write-env]
+    timeout_seconds: 300
+
+  - id: artisan-cache
+    tool: run_script
+    description: "Mettre en cache la config, les routes et les vues"
+    params:
+      cwd: /var/www/monapp
+      command: "php artisan config:cache && php artisan route:cache && php artisan view:cache"
+      run_as: www-data
+    depends_on: [artisan-migrate]
+
+  - id: set-permissions
+    tool: set_www_permissions
+    description: "Fixer les permissions sur storage/ et bootstrap/cache/"
+    params:
+      path: /var/www/monapp
+      framework: laravel
+    depends_on: [composer-install]
+
+  # --- Phase 5 : web & TLS ---
+
+  - id: create-vhost
+    tool: create_nginx_vhost
+    description: "Créer le vhost Nginx pour monapp.fr (HTTP uniquement d'abord)"
+    params:
+      server_name: monapp.fr
+      document_root: /var/www/monapp/public
+      stack: laravel
+      tls: false
+    depends_on: [set-permissions]
+
+  - id: enable-vhost
+    tool: enable_vhost
+    description: "Activer le vhost et recharger Nginx"
+    params:
+      server_name: monapp.fr
+    depends_on: [create-vhost]
+
+  - id: request-cert
+    tool: request_certificate
+    description: "Obtenir un certificat Let's Encrypt"
+    params:
+      domains: [monapp.fr]
+      email: admin@monapp.fr
+      method: nginx
+    depends_on: [enable-vhost]
+    on_error: retry
+    retry:
+      max_attempts: 3
+      delay_seconds: 30
+      backoff: exponential
+
+  - id: reload-nginx
+    tool: reload_webserver
+    params:
+      webserver: nginx
+    depends_on: [request-cert]
+
+  # --- Phase 6 : workers et planifs ---
+
+  - id: add-scheduler-cron
+    tool: add_cron
+    description: "Planifier le Laravel scheduler (toutes les minutes)"
+    params:
+      user: www-data
+      schedule: "* * * * *"
+      command: "cd /var/www/monapp && php artisan schedule:run >> /dev/null 2>&1"
+      identifier: monapp-scheduler
+    depends_on: [artisan-cache]
+
+  - id: create-queue-worker
+    tool: create_systemd_timer
+    description: "Installer un service systemd pour le queue worker"
+    params:
+      unit_name: monapp-queue
+      command: "php /var/www/monapp/artisan queue:work --sleep=3 --tries=3"
+      user: www-data
+      restart: always
+    depends_on: [artisan-cache]
+
+  # --- Phase 7 : backups & firewall ---
+
+  - id: initial-backup
+    tool: create_backup
+    description: "Backup initial (code + BDD)"
+    params:
+      label: monapp-initial
+      include:
+        - /var/www/monapp
+      databases: [${db.name}]
+    depends_on: [reload-nginx]
+
+  - id: ufw-allow-https
+    tool: ufw_allow_port
+    description: "S'assurer que 443 est ouvert"
+    params:
+      port: 443
+      protocol: tcp
+    depends_on: [reload-nginx]
+    on_error: continue
+
+  # --- Phase 8 : vérification finale ---
+
+  - id: verify-https
+    tool: http_check
+    description: "Vérifier que le site répond en HTTPS"
+    params:
+      url: https://monapp.fr
+      expected_status: 200
+      timeout_seconds: 10
+    depends_on: [reload-nginx]
+    on_error: retry
+    retry:
+      max_attempts: 3
+      delay_seconds: 5
+      backoff: constant
+
+  - id: notify-done
+    tool: notify_webhook
+    description: "Notifier la fin de déploiement"
+    params:
+      url: https://hooks.example.com/deploy-done
+      payload:
+        mission_id: ${mission_id}
+        domain: monapp.fr
+        status: success
+    depends_on: [verify-https]
+    on_error: continue
